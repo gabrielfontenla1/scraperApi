@@ -1,12 +1,39 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_file
+from flask_cors import CORS
 import json
 import time
 import threading
 import uuid
+import pandas as pd
+import io
 from datetime import datetime
 from serpapi import Client
+from config import ProductionConfig, DevelopmentConfig
+import os
 
 app = Flask(__name__)
+
+# Load configuration based on environment
+if os.environ.get('FLASK_ENV') == 'production':
+    app.config.from_object(ProductionConfig())
+else:
+    app.config.from_object(DevelopmentConfig())
+
+# Configure CORS with more specific settings
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "http://localhost:3000",
+            "http://localhost:3001",
+            "https://*.vercel.app",  # Allow all Vercel preview deployments
+            os.environ.get('CORS_ORIGINS', '*')  # Allow custom origins from environment
+        ],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "expose_headers": ["Content-Type", "Content-Disposition"],
+        "supports_credentials": True
+    }
+})
 
 tareas_activas = {}
 
@@ -292,50 +319,63 @@ def scrape_odontologos(cfg: dict, task_id: str):
             agregados = 0
             while True:
                 params = {
-                    "engine":   "google_local",
-                    "type":     "search",
-                    "q":        query,
-                    "location": f"{prov}, {country}",
-                    "hl":       "es",
-                    "gl":       country_cc,
-                    "start":    start
+                    "engine": "google_local",
+                    "type": "search",
+                    "q": query,
+                    "location": prov,  # Remove the country to avoid mixing results
+                    "hl": "es",
+                    "gl": country_cc,
+                    "start": start,
+                    "api_key": api_key,
+                    "location_requested": True,  # Force location-based results
+                    "location_used": True       # Ensure location is respected
                 }
 
-                rsp = client.search(params)
+                try:
+                    rsp = client.search(params)
+                    resultados = rsp.get("local_results", [])
+                    
+                    if not resultados:
+                        if start == 0:  # Only add warning if no results on first page
+                            tareas_activas[task_id]["warnings"].append(
+                                f"{prov}: No se encontraron resultados para esta búsqueda.")
+                        break
 
-                if "error" in rsp:
+                    for r in resultados:
+                        # Verify the result is from the correct province
+                        address = r.get("address", "").lower()
+                        if not address or prov.lower() not in address.lower():
+                            continue  # Skip results from other provinces
+                            
+                        pid = r.get("place_id")
+                        if pid and pid not in vistos:
+                            vistos.add(pid)
+                            datos_por_prov[prov].append({
+                                "place_id": pid,
+                                "title": r.get("title", ""),
+                                "address": r.get("address", ""),
+                                "phone": r.get("phone", ""),
+                                "website": r.get("website", ""),
+                                "rating": r.get("rating"),
+                                "reviews": r.get("reviews"),
+                                "type": r.get("type", ""),
+                                "hours": r.get("hours", {}),
+                                "gps_coordinates": r.get("gps_coordinates", {}),
+                                "province": prov
+                            })
+                            agregados += 1
+                            total += 1
+
+                    if not rsp.get("serpapi_pagination", {}).get("next"):
+                        break
+
+                    start += 20
+                    time.sleep(delay)
+
+                except Exception as e:
                     tareas_activas[task_id]["warnings"].append(
-                        f"{prov}: {rsp['error']}")
+                        f"{prov}: Error al procesar resultados - {str(e)}")
                     break
-
-                resultados = rsp.get("local_results", [])
-                if not resultados:
-                    break
-
-                for r in resultados:
-                    pid = r.get("place_id")
-                    if pid and pid not in vistos:
-                        vistos.add(pid)
-                        datos_por_prov[prov].append({
-                            "place_id": pid,
-                            "title": r.get("title", ""),
-                            "address": r.get("address", ""),
-                            "phone": r.get("phone", ""),
-                            "website": r.get("website", ""),
-                            "rating": r.get("rating"),
-                            "reviews": r.get("reviews"),
-                            "type": r.get("type", ""),
-                            "hours": r.get("hours", {}),
-                            "gps_coordinates": r.get("gps_coordinates", {}),
-                            "province": prov
-                        })
-                        agregados += 1
-                        total += 1
-
-                if not rsp.get("serpapi_pagination", {}).get("next"):
-                    break
-                start += 20
-                time.sleep(delay)
 
             tareas_activas[task_id]["provinces_completed"].append(
                 {"name": prov, "count": agregados}
@@ -424,12 +464,71 @@ def download_json(task_id):
     if t["status"] != "completed":
         return jsonify(error="Tarea no completada aún", status=t["status"]), 400
 
-    return Response(
-        json.dumps(t["results"], ensure_ascii=False, indent=2),
-        mimetype="application/json",
-        headers={"Content-Disposition":
-                 f"attachment; filename=odontologos_{task_id}.json"}
-    )
+    # Get the requested format from query parameters, default to json
+    format_type = request.args.get('format', 'json')
+
+    if format_type == 'json':
+        return Response(
+            json.dumps(t["results"], ensure_ascii=False, indent=2),
+            mimetype="application/json",
+            headers={"Content-Disposition":
+                     f"attachment; filename=odontologos_{task_id}.json"}
+        )
+    elif format_type == 'excel':
+        # Convert the nested dictionary to a flat list of records
+        records = []
+        for province, items in t["results"].items():
+            for item in items:
+                item['province'] = province  # Add province to each record
+                records.append(item)
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(records)
+        
+        # Reorder columns to put important info first
+        columns_order = ['province', 'title', 'address', 'phone', 'website', 'rating', 
+                        'reviews', 'type', 'place_id']
+        other_columns = [col for col in df.columns if col not in columns_order]
+        final_columns = columns_order + other_columns
+        
+        # Reorder and rename columns for better readability
+        df = df[final_columns]
+        column_names = {
+            'province': 'Provincia',
+            'title': 'Nombre',
+            'address': 'Dirección',
+            'phone': 'Teléfono',
+            'website': 'Sitio Web',
+            'rating': 'Calificación',
+            'reviews': 'Reseñas',
+            'type': 'Tipo',
+            'place_id': 'ID de Google'
+        }
+        df = df.rename(columns=column_names)
+        
+        # Create Excel file in memory
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Resultados')
+            
+            # Auto-adjust columns width
+            worksheet = writer.sheets['Resultados']
+            for idx, col in enumerate(df.columns):
+                max_length = max(
+                    df[col].astype(str).apply(len).max(),
+                    len(str(col))
+                ) + 2
+                worksheet.column_dimensions[chr(65 + idx)].width = max_length
+        
+        output.seek(0)
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f'odontologos_{task_id}.xlsx'
+        )
+    else:
+        return jsonify(error="Formato no soportado"), 400
 
 @app.route('/tasks')
 def listar_tareas():
@@ -469,7 +568,7 @@ def health():
 @app.route('/')
 def doc():
     return jsonify(
-        name="API Scraper Odontólogos",
+        name="API Scraper ",
         version="1.0.0",
         endpoints={
             "POST /scrape": "Inicia scraping",
@@ -491,5 +590,9 @@ def doc():
     )
 
 if __name__ == '__main__':
-    print("🚀 API Scraper Odontólogos corriendo en http://localhost:5001/")
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    print(f"🚀 API Scraper corriendo en http://localhost:{app.config['PORT']}/")
+    app.run(
+        host=app.config['HOST'],
+        port=app.config['PORT'],
+        debug=app.config['DEBUG']
+    )
